@@ -2,11 +2,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
 #include <errno.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #define ADDR_QUEUE	100	/* maximum number of connections at a time */
 #define BUF_LEN		20	/* maximum buffer length for send() */
@@ -43,7 +45,7 @@ void kill_zombies(int sig_num)
 	unsigned int errno_backup;
 
 	errno_backup = errno;
-	wait();
+	wait(0);
 	errno = errno_backup;
 }
 
@@ -259,9 +261,14 @@ void main()
 
 	if(!pid_manage)
 	{
-		static	struct	sockaddr_in	client_addr_queue[ADDR_QUEUE];
-		int	client_sock_queue[ADDR_QUEUE];
-		unsigned short int client_queue;
+		static	struct	sockaddr_in	client_addr_queue[ADDR_QUEUE],
+						client_addr;
+		int	client_sock_queue[ADDR_QUEUE],
+			client_sock,
+			activity;
+		unsigned short int client_queue,
+			max_fdval = 0;
+		fd_set	client_array;
 
 		/* uninstall the signal handler and close the server socket, write-end of the pipe */
 
@@ -269,14 +276,64 @@ void main()
 		close(server_sock);
 		close(pipe_auth[1]);
 
+		/* initialize the client socket queue to zero */
+
+		for(loop = 0;loop < ADDR_QUEUE;loop++)
+			client_sock_queue[loop] = 0;
+
+		FD_ZERO(&client_array);
+		FD_SET(pipe_auth[0],&client_array);
+
+		if(pipe_auth[0] > max_fdval)
+			max_fdval = pipe_auth[1];
+
 		client_queue = 0;
 		while(1)
 		{
-			if(read(pipe_auth[0],&client_sock_queue[client_queue],sizeof(int)) > 0)
-				if(read(pipe_auth[0],&client_addr_queue[client_queue],sizeof(struct sockaddr)) > 0)
+			activity = select(max_fdval + 1, &client_array, NULL, NULL, NULL);
+
+			if(FD_ISSET(pipe_auth[0], &client_array))
+			{
+				if(read(pipe_auth[0],&client_sock,sizeof(int)) > 0)
+					if(read(pipe_auth[0],&client_addr,sizeof(struct sockaddr)) > 0)
+					{
+						printf("login success from %s\n",inet_ntoa(client_addr.sin_addr));
+
+						for(client_queue = 0;client_queue < ADDR_QUEUE;client_queue++)
+						{
+							if(client_sock_queue[client_queue] == 0)
+							{
+								client_sock_queue[client_queue] = client_sock;
+								client_addr_queue[client_queue] = client_addr;
+
+								FD_SET(client_sock_queue[client_queue], &client_array);
+								if(client_sock_queue[client_queue] > max_fdval)
+									max_fdval = client_sock_queue[client_queue];
+								break;
+							}
+						}
+						if(client_queue == ADDR_QUEUE)
+							printf("client queue is full ...\n");
+					}
+			}
+
+			else
+				for(client_queue = 0;client_queue < ADDR_QUEUE;client_queue++)
 				{
-					printf("login success from %s\n",inet_ntoa(client_addr_queue[client_queue].sin_addr));
-					client_queue++;
+					if(client_sock_queue[client_queue])
+						if(FD_ISSET(client_sock_queue[client_queue], &client_array))
+					{
+						addr_len = sizeof(struct sockaddr);
+						if((recv_byte = recvfrom(client_sock_queue[client_queue],server_buf,BUF_LEN,0,
+									(struct sockaddr *)&client_addr_queue[client_queue],&addr_len)) == 0)
+						{
+							printf("closing\n");
+							close(client_sock_queue[client_queue]);
+
+							client_sock_queue[client_queue] = 0;
+							FD_CLR(client_sock_queue[client_queue], &client_array);
+						}
+					}
 				}
 		}
 		exit(1);
